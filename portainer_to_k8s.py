@@ -22,7 +22,7 @@ class PortainerClient:
     def __init__(
         self,
         base_url: str,
-        endpoint_id: int,
+        endpoint_id: Optional[int] = None,
         api_key: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
@@ -53,6 +53,20 @@ class PortainerClient:
 
         payload = response.json()
         return payload["jwt"]
+
+    def get_endpoints(self) -> List[Dict[str, Any]]:
+        """Retrieve a list of available endpoints (environments)."""
+        # Try /api/endpoints (legacy) first
+        try:
+            response = self.session.get(f"{self.base_url}/api/endpoints", params={"limit": 100}, timeout=15)
+            if response.status_code == 404:
+                # Fallback to /api/environments (Portainer 2.19+)
+                response = self.session.get(f"{self.base_url}/api/environments", params={"limit": 100}, timeout=15)
+            
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+             raise RuntimeError(f"Failed to retrieve endpoints: {e}")
 
     def resolve_container_id(self, container_ref: str) -> str:
         """Allow users to reference a container by prefix or name."""

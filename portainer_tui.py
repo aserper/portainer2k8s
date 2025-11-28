@@ -22,6 +22,7 @@ from textual.widgets import (
     Static,
     TextArea,
 )
+from textual.widgets.option_list import Option
 
 from config import config_exists, load_config, save_config
 from portainer_to_k8s import (
@@ -30,6 +31,102 @@ from portainer_to_k8s import (
     dump_yaml,
     sanitize_name,
 )
+
+
+
+class EndpointSelectScreen(Screen):
+    """Screen to select an endpoint (environment)."""
+
+    CSS = """
+    EndpointSelectScreen {
+        align: center middle;
+    }
+
+    #endpoint-select-box {
+        width: 80;
+        height: auto;
+        border: solid $primary;
+        background: $surface;
+    }
+
+    #endpoint-list {
+        height: 15;
+        margin: 2;
+    }
+
+    #title {
+        text-style: bold;
+        text-align: center;
+        margin: 1 2;
+        width: 100%;
+    }
+
+    Button {
+        margin: 0 2;
+    }
+    #button-container {
+        height: auto;
+        align: center middle;
+        margin-top: 2;
+    }
+    """
+
+    def __init__(self, endpoints: List[Dict[str, Any]]) -> None:
+        super().__init__()
+        self.endpoints = endpoints
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        with Container(id="endpoint-select-box"):
+            yield Label("Select Portainer Endpoint", id="title")
+            with ScrollableContainer(id="endpoint-list"):
+                yield OptionList(id="endpoints")
+
+            with Horizontal(id="button-container"):
+                yield Button("Select", id="btn-select", variant="primary")
+                yield Button("Back", id="btn-back")
+                yield Button("Quit", id="btn-quit", variant="error")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        option_list = self.query_one("#endpoints", OptionList)
+        for endpoint in self.endpoints:
+            name = endpoint.get("Name", "Unnamed")
+            e_id = str(endpoint.get("Id", "?"))
+            option_list.add_option(Option(f"{name} (ID: {e_id})", id=e_id))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-quit":
+            self.app.exit()
+        elif event.button.id == "btn-back":
+            self.app.pop_screen()
+        elif event.button.id == "btn-select":
+            self._select_endpoint()
+
+    def _select_endpoint(self) -> None:
+        option_list = self.query_one("#endpoints", OptionList)
+        if option_list.highlighted is None:
+            self.app.notify("Please select an endpoint", severity="warning")
+            return
+
+        selected = option_list.get_option_at_index(option_list.highlighted)
+        if selected and selected.id:
+            endpoint_id = int(selected.id)
+            self.app.client.endpoint_id = endpoint_id
+
+            # Save config now
+            config_data = self.app.pending_config
+            try:
+                save_config(
+                    url=config_data["url"],
+                    endpoint_id=endpoint_id,
+                    api_key=config_data["api_key"],
+                    username=config_data["username"],
+                )
+                self.app.notify("Configuration saved!", severity="information")
+                self.app.push_screen(ContainerSelectScreen())
+            except Exception as e:
+                self.app.notify(f"Could not save config: {e}", severity="warning")
 
 
 class ConfigWizardScreen(Screen):
@@ -125,14 +222,6 @@ class ConfigWizardScreen(Screen):
                     id="portainer-url",
                 )
 
-            # Endpoint ID
-            with Vertical(classes="form-group"):
-                yield Label("Endpoint ID", classes="form-label")
-                yield Input(
-                    placeholder="1",
-                    id="endpoint-id",
-                )
-
             # Authentication method
             with Vertical(classes="form-group"):
                 yield Label("Authentication Method", classes="form-label")
@@ -210,23 +299,12 @@ class ConfigWizardScreen(Screen):
     def _save_and_connect(self) -> None:
         """Save configuration and attempt connection."""
         url = self.query_one("#portainer-url", Input).value.strip()
-        endpoint_id_str = self.query_one("#endpoint-id", Input).value.strip()
         auth_method_list = self.query_one("#auth-method", OptionList)
         auth_method = auth_method_list.highlighted
 
         # Validation
         if not url:
             self.app.notify("Please enter a Portainer URL", severity="error")
-            return
-
-        if not endpoint_id_str.isdigit():
-            self.app.notify("Endpoint ID must be a number", severity="error")
-            return
-
-        try:
-            endpoint_id = int(endpoint_id_str)
-        except ValueError:
-            self.app.notify("Invalid endpoint ID", severity="error")
             return
 
         if auth_method == 0:  # API Key
@@ -248,27 +326,28 @@ class ConfigWizardScreen(Screen):
         try:
             client = PortainerClient(
                 base_url=url,
-                endpoint_id=endpoint_id,
+                endpoint_id=None,
                 api_key=api_key,
                 username=username,
                 password=password,
             )
+
+            # Fetch endpoints
+            endpoints = client.get_endpoints()
+            if not endpoints:
+                self.app.notify("No endpoints found on this Portainer instance", severity="warning")
+                return
             
-            # Connection successful - save config
-            try:
-                save_config(
-                    url=url,
-                    endpoint_id=endpoint_id,
-                    api_key=api_key,
-                    username=username,
-                )
-                self.app.notify("Configuration saved to config.yaml!", severity="information")
-            except Exception as e:
-                self.app.notify(f"Warning: Could not save config: {str(e)}", severity="warning")
-            
-            # Move to container selection
+            # Store client and pending config
             self.app.client = client
-            self.app.push_screen(ContainerSelectScreen())
+            self.app.pending_config = {
+                "url": url,
+                "api_key": api_key,
+                "username": username,
+            }
+            
+            # Move to endpoint selection
+            self.app.push_screen(EndpointSelectScreen(endpoints))
             
         except Exception as e:
             self.app.notify(f"Connection failed: {str(e)}", severity="error")
@@ -558,7 +637,7 @@ class ContainerSelectScreen(Screen):
                 name = names[0].lstrip("/") if names else "unnamed"
                 status = container.get("State", "unknown")
                 display = f"{name} ({container_id}) - {status}"
-                option_list.add_option(display, container["Id"])
+                option_list.add_option(Option(display, id=container["Id"]))
 
             self.query_one("#status-message", Static).update("✓ Containers loaded")
             self.containers_loaded = True
@@ -583,9 +662,9 @@ class ContainerSelectScreen(Screen):
             return
 
         # Get the selected option
-        selected_option = list(option_list.get_option_at_index(option_list.highlighted))
-        if len(selected_option) >= 2:
-            container_id = selected_option[1]
+        selected_option = option_list.get_option_at_index(option_list.highlighted)
+        if selected_option and selected_option.id:
+            container_id = selected_option.id
             self.app.selected_container_id = container_id
             self.app.push_screen(ConfigureScreen())
 
@@ -829,11 +908,16 @@ class PortainerToK8sApp(App):
 
     def on_mount(self) -> None:
         """Start with appropriate screen based on config file existence."""
-        self.client: Optional[PortainerClient] = None
-        self.selected_container_id: Optional[str] = None
-        self.manifest: str = ""
-        self.container_details: Dict[str, Any] = {}
-        self.config: Optional[Dict[str, Any]] = None
+        if not hasattr(self, "client"):
+            self.client: Optional[PortainerClient] = None
+        if not hasattr(self, "selected_container_id"):
+            self.selected_container_id: Optional[str] = None
+        if not hasattr(self, "manifest"):
+            self.manifest: str = ""
+        if not hasattr(self, "container_details"):
+            self.container_details: Dict[str, Any] = {}
+        if not hasattr(self, "config"):
+            self.config: Optional[Dict[str, Any]] = None
         
         # Check if configuration exists
         if config_exists():
